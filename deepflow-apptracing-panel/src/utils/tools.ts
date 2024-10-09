@@ -1,6 +1,7 @@
 import { DataFrame } from '@grafana/data'
 import _ from 'lodash'
 import { useState, useEffect, useRef } from 'react'
+import { getDataSourceSrv } from '@grafana/runtime'
 
 export function genServiceId(item: { service_uid: string }) {
   return item.service_uid
@@ -166,7 +167,7 @@ export function dealPercentageValue(v: unknown) {
 
 const RELATED_TYPE_FIELDS_MAP = {
   traceid: ['trace_id'],
-  xrequestid: ['x_request_id'],
+  xrequestid: ['x_request_id_0', 'x_request_id_1'],
   app: ['span_id', 'parent_span_id'],
   network: ['req_tcp_seq', 'resp_tcp_seq'],
   syscall: ['syscall_trace_id_request', 'syscall_trace_id_response']
@@ -191,20 +192,21 @@ export function getRelatedData(item: any, fullData: any) {
       })
     }
   })
-  const result = [
-    ...relateData.map((e: any) => {
+  const result = relateData
+    .map((e: any) => {
       return {
         ...fullDataKeyById[e.id],
         __related: e
       }
     })
-  ]
 
   item.__hightLights = {}
-  result.forEach(e => {
-    const relatedFields = RELATED_TYPE_FIELDS_MAP[e.__related.type as keyof typeof RELATED_TYPE_FIELDS_MAP]
+  result.forEach((e: any) => {
+    const relatedFields = e.__related.type.split(',').map((k: keyof typeof RELATED_TYPE_FIELDS_MAP) => {
+      return RELATED_TYPE_FIELDS_MAP[k]
+    })
     e.__hightLights = {}
-    const _relatedFields = [...relatedFields].sort(() => -1)
+    const _relatedFields = relatedFields ? [...relatedFields].sort(() => -1) : []
     relatedFields.forEach((k: string, i: number) => {
       if (RELATED_EQUAL_INVALID_VALUES.includes(e[k])) {
         return
@@ -228,7 +230,12 @@ export function getRelatedData(item: any, fullData: any) {
       }
     })
   })
-  return [item, ...result]
+  return [
+    item,
+    ..._.uniqBy(result, (e: any) => {
+      return e.__related._id
+    })
+  ]
 }
 
 export function formatDetailList(detailList: any[], metaCustom: any) {
@@ -317,4 +324,30 @@ export function formatDetailList(detailList: any[], metaCustom: any) {
     result[e['toString(_id)']] = Object.fromEntries(item)
   })
   return result
+}
+
+export async function getDeepFlowDatasource() {
+  const deepFlowName = getDataSourceSrv()
+    .getList()
+    .find(dataSource => {
+      return dataSource.type === 'deepflowio-deepflow-datasource'
+    })?.name
+  return await getDataSourceSrv().get(deepFlowName)
+}
+
+export function findLastVisibleTextNode(doc: any) {
+  let lastTextNode = null
+
+  function traverse(node: any) {
+    node.childNodes.forEach((child: any) => {
+      if (child.nodeType === Node.TEXT_NODE && child.textContent.trim() !== '') {
+        lastTextNode = child // 更新最后一个有效的文本节点
+      } else if (child.nodeType === Node.ELEMENT_NODE) {
+        traverse(child) // 递归遍历元素节点
+      }
+    })
+  }
+
+  traverse(doc)
+  return lastTextNode
 }

@@ -21,14 +21,15 @@ export function getStringLen(str: string) {
 }
 
 export const RELATED_DATA_DISPLAY_COLUMNS = [
-  'Enum(tap_side)',
+  'Enum(observation_point)',
   'Enum(l7_protocol)',
   'request_type',
   'request_resource',
   'trace_id',
   'span_id',
   'parent_span_id',
-  'x_request_id',
+  'x_request_id_0',
+  'x_request_id_1',
   'syscall_trace_id_request',
   'syscall_trace_id_response',
   'req_tcp_seq',
@@ -96,7 +97,7 @@ export function tarnsArrayToTableData(data: any[]) {
 export function formatRelatedData(data: any) {
   const result: any = []
 
-  ;[...RELATED_DATA_DISPLAY_COLUMNS, HIGH_LIGHTS_KEY, ACTION_ROW].forEach((k, i) => {
+  ;[...RELATED_DATA_DISPLAY_COLUMNS, HIGH_LIGHTS_KEY, ACTION_ROW].forEach((k) => {
     result.push({
       keyName: k,
       ...Object.fromEntries(

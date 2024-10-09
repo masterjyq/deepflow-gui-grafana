@@ -23,7 +23,7 @@ export function uuid() {
   return s4() + s4() + '-' + s4() + '-' + s4() + '-' + s4() + '-' + s4() + s4() + s4()
 }
 
-const TAG_OPERATORS_MAP = {
+export const TAG_OPERATORS_MAP = {
   LIKE: {
     display_name: ':',
     description: 'string, * for wildcard',
@@ -93,7 +93,8 @@ export function formatTagOperators(item: Record<any, any> & { operators: string[
   operators
     .filter(op => {
       const isStringType = item.type === 'string'
-      if (isStringType) {
+      const isNotSpecTag = !['profile_event_type'].includes(item.name)
+      if (isStringType && isNotSpecTag) {
         return !['=', '!=', 'IN', 'NOT IN'].includes(op)
       }
       return true
@@ -308,7 +309,7 @@ export function genGetTagValuesSql(
     keyword
   }: {
     tagName: string
-    tagType?: string
+    tagType: string
     from: string
     keyword: string | Array<number | string>
   },
@@ -318,17 +319,18 @@ export function genGetTagValuesSql(
   if (useEqual) {
     cond = (keyword as Array<number | string>)
       .map(kw => {
-        return `${tagName}=${typeof kw === 'number' ? kw : `'${kw}'`}`
+        return `${tagType === 'resource' ? `${tagName}_id` : tagName}=${typeof kw === 'number' ? kw : `'${kw}'`}`
       })
       .join(' OR ')
   } else {
     // tag of map type children, can only search by value, but value is same as description
-    const ONLY_USE_NAME_LIKE_TAG_TYPES = ['resource', 'int_enum', 'string_enum', 'resource_array']
+    const ONLY_USE_NAME_LIKELY_TAG_TYPES = ['resource', 'int_enum', 'string_enum', 'resource_array']
+    const ENUM_LIKELY_TAG_TYPES = ['enum', 'int_enum', 'string_enum']
 
     const likeVal = (keyword as string) || '*'
     cond = [
-      `Enum(${tagName})`,
-      ...(ONLY_USE_NAME_LIKE_TAG_TYPES.includes((tagType as string).toLocaleLowerCase()) ? [] : [tagName])
+      ENUM_LIKELY_TAG_TYPES.includes(tagType as string) ? `Enum(${tagName})` : tagName,
+      ...(ONLY_USE_NAME_LIKELY_TAG_TYPES.includes((tagType as string).toLocaleLowerCase()) ? [] : [tagName])
     ]
       .map(e => {
         // @ts-ignore
@@ -385,6 +387,9 @@ export function getTracingQuery({ metrics, tags }: any) {
       })
 
     const _tags = tags
+      .filter((e: any) => {
+        return !e?.not_supported_operators.includes('select')
+      })
       .map((e: any) => {
         const isEnumLikely = isEnumLikelyTag(e)
         const isJSONTag = JSON_TAGS.find(jsonTag => {

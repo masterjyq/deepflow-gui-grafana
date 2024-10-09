@@ -1,7 +1,7 @@
 import { ScopedVars } from '@grafana/data'
 import { getTemplateSrv } from '@grafana/runtime'
 import { BasicData } from 'components/QueryEditorFormRow'
-import { SLIMIT_DEFAULT_VALUE, VAR_INTERVAL_LABEL } from 'consts'
+import { APP_TYPE, SLIMIT_DEFAULT_VALUE, VAR_INTERVAL_LABEL } from 'consts'
 import _ from 'lodash'
 import { LabelItem } from 'QueryEditor'
 // import { MyQuery } from 'types'
@@ -148,8 +148,21 @@ function jointOrAnd(conditionList: any) {
   return result
 }
 
-function formatWithsubFuncs(target: any) {
-  const { subFuncs, func, key, params } = target
+function formatWithSubFuncs(target: any) {
+  const { subFuncs: _subFuncs, func: _func, key: _key, params: _params, preFunc } = target
+  let subFuncs = _.cloneDeep(_subFuncs) || []
+  let func = _func
+  let params = _params
+  let key = _key
+  if (preFunc && _func) {
+    func = preFunc
+    subFuncs.unshift({
+      func: _func,
+      params: params
+    })
+
+    params = ''
+  }
   if (!Array.isArray(subFuncs) || !subFuncs.length) {
     return target
   }
@@ -168,7 +181,7 @@ function formatWithsubFuncs(target: any) {
           key,
           params
         },
-        e.params
+        ...(Array.isArray(e.params) ? e.params : [e.params])
       ]
     } else {
       const prev = result[i - 1]
@@ -197,7 +210,7 @@ function selectFormat(data: any): {
       return item.key
     })
     .forEach((item: BasicData) => {
-      const validKeys = ['key', 'func', 'params', 'as', 'subFuncs'] as const
+      const validKeys = ['key', 'func', 'params', 'as', 'subFuncs', 'preFunc'] as const
       const result: any = {}
       validKeys.forEach(key => {
         if (_.isNumber(item[key]) || !_.isEmpty(item[key])) {
@@ -209,11 +222,11 @@ function selectFormat(data: any): {
       if (resultKeys.length === 1 && resultKeys[0] === 'key') {
         target.push(result.key)
       } else {
-        target.push(formatWithsubFuncs(result))
+        target.push(formatWithSubFuncs(result))
       }
     })
 
-  if (appType === 'appTracing') {
+  if (appType === APP_TYPE.TRACING) {
     TAGS.push({
       key: '_id',
       func: 'TO_STRING'
@@ -277,7 +290,7 @@ export function getValueByVariablesName(val: LabelItem, variables: any[], op: st
 function whereFormat(data: any, variables: any[], scopedVars: ScopedVars) {
   const { db, from, where, having } = data
   const fullData = where.concat(having)
-  const validKeys = ['type', 'key', 'func', 'op', 'val', 'params', 'subFuncs', 'whereOnly'] as const
+  const validKeys = ['type', 'key', 'func', 'op', 'val', 'params', 'subFuncs', 'whereOnly', 'preFunc'] as const
   const result = fullData
     .filter((item: BasicData) => {
       return item.key
@@ -308,13 +321,13 @@ function whereFormat(data: any, variables: any[], scopedVars: ScopedVars) {
       const isEnumTag = result.type === 'tag' && isEnumLikelyTag(tagMapItem)
       return {
         isForbidden: false,
-        ...(result.type === 'tag' || !result?.subFuncs?.length
-          ? result
-          : {
+        ...(result.type === 'metric' && (result?.subFuncs?.length || (result.preFunc && result.func))
+          ? {
               type: result.type,
               op: result.op,
-              val: [formatWithsubFuncs(result), result.val]
-            }),
+              val: [formatWithSubFuncs(result), result.val]
+            }
+          : result),
         ...(isEnumTag && (result.op.toUpperCase().includes('LIKE') || result.op.toUpperCase().includes('REGEXP'))
           ? {
               func: 'Enum'
@@ -418,8 +431,11 @@ function getInterval(intervalStr: string, variables: any[]) {
   return isNaN(Number(interval)) ? intervalTrans(interval, variableItem) : interval
 }
 
-function groupByFormat(data: any, variables: any[]) {
+function groupByFormat(data: any, variables: any[], dataOriginal: any) {
   const intervalValue = getInterval(data.interval, variables)
+  const intervalValueOriginal = dataOriginal.interval
+  const intervalValueOriginalIsVariable =
+    typeof intervalValueOriginal === 'string' && intervalValueOriginal.startsWith('$')
   return [
     ...(data.interval
       ? [
@@ -427,7 +443,7 @@ function groupByFormat(data: any, variables: any[]) {
             func: 'interval',
             key: 'time',
             params: intervalValue,
-            as: `time_${intervalValue}`
+            as: intervalValueOriginalIsVariable ? 'time_value' : `time_${intervalValue}`
           }
         ]
       : []),
@@ -449,7 +465,7 @@ function groupByFormat(data: any, variables: any[]) {
 }
 
 function orderByFormat(orderBy: BasicData[]) {
-  const validKeys = ['key', 'func', 'params', 'sort', 'subFuncs'] as const
+  const validKeys = ['key', 'func', 'params', 'sort', 'subFuncs', 'preFunc'] as const
   return orderBy
     .filter((item: BasicData) => {
       return item.key
@@ -476,13 +492,17 @@ function orderByFormat(orderBy: BasicData[]) {
         }
       })
       return {
-        ...formatWithsubFuncs(result),
+        ...formatWithSubFuncs(result),
         desc: result.desc
       }
     })
 }
 
-export function genQueryParams(queryData: Record<any, any>, scopedVars: ScopedVars) {
+export function genQueryParams(
+  queryData: Record<any, any>,
+  scopedVars: ScopedVars,
+  queryDataOriginal: Record<any, any>
+) {
   const keys = [
     'db',
     'from',
@@ -518,7 +538,7 @@ export function genQueryParams(queryData: Record<any, any>, scopedVars: ScopedVa
         }
       ]
     },
-    groupBy: groupByFormat(data, variables),
+    groupBy: groupByFormat(data, variables, queryDataOriginal),
     orderBy: orderByFormat(data.orderBy as BasicData[]),
     ...((data?.groupBy as BasicData[]).filter(e => e.key).length && data.interval
       ? { slimit: data.slimit === undefined || data.slimit === '' ? SLIMIT_DEFAULT_VALUE : data.slimit }
@@ -526,7 +546,26 @@ export function genQueryParams(queryData: Record<any, any>, scopedVars: ScopedVa
     limit: data.limit,
     offset: data.offset
   }
+
   return result
+}
+
+const convertIntervalStringToSeconds = (intervalStr?: string) => {
+  if (!intervalStr) {
+    return intervalStr
+  }
+  const num = parseInt(intervalStr, 10)
+  const unit = intervalStr.replace(`${num}`, '')
+  const unitSecondsMap = {
+    s: 1,
+    m: 60,
+    h: 60 * 60,
+    d: 24 * 60 * 60
+  } as const
+  if (!unitSecondsMap[`${unit}` as keyof typeof unitSecondsMap]) {
+    return intervalStr
+  }
+  return num * unitSecondsMap[`${unit}` as keyof typeof unitSecondsMap]
 }
 
 export const replaceIntervalAndVariables = (queryText: string, scopedVars?: ScopedVars) => {
@@ -545,7 +584,37 @@ export const replaceIntervalAndVariables = (queryText: string, scopedVars?: Scop
       .split(VAR_INTERVAL_LABEL)
       .join(intervalSecond + '')
   }
+  getTemplateSrv()
+    .getVariables()
+    .forEach(e => {
+      if (e.type === 'interval') {
+        const value = _.get(e, ['current', 'value'])
+        const valueAfterConvert = convertIntervalStringToSeconds(value as string)
+        if (value !== valueAfterConvert) {
+          const id = _.get(e, 'id')
+          _queryText = _queryText.split(`"$${id}"`).join(valueAfterConvert + '')
+        }
+      }
+    })
   return getTemplateSrv().replace(_queryText, scopedVars)
 }
 
 export default genQueryParams
+
+export const getProfilingSql = (sql: string) => {
+  const regex = /WHERE\s(.*?)\s(?=LIMIT|$)/i
+  const match = sql.match(regex)
+
+  if (match && match[1]) {
+    return match[1].trim()
+  } else {
+    return sql
+  }
+}
+
+export const getFiledValueFormSql = (sql: string, field: string) => {
+  const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const regex = new RegExp(`\`?${escapedField}\`?\\s+IN\\s+\\('([^']*)'\\)`)
+  const match = sql.match(regex)
+  return match ? match[1] : undefined
+}

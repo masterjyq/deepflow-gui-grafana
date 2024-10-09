@@ -3,7 +3,7 @@ import { QueryEditorProps, VariableModel } from '@grafana/data'
 import { DataSource } from './datasource'
 import { MyDataSourceOptions, MyQuery } from './types'
 import { Button, InlineField, Select, Input, Alert, getTheme, Icon, Tooltip } from '@grafana/ui'
-import { QueryEditorFormRow } from './components/QueryEditorFormRow'
+import { BasicData, QueryEditorFormRow } from './components/QueryEditorFormRow'
 import _ from 'lodash'
 import * as querierJs from 'deepflow-sdk-js'
 import {
@@ -20,7 +20,7 @@ import { getTemplateSrv } from '@grafana/runtime'
 import {
   ALERTING_ALLOW_APP_TYPE,
   appTypeOpts,
-  APPTYPE_APP_TRACING_FLAME,
+  APP_TYPE,
   BasicDataWithId,
   defaultFormData,
   defaultFormDB,
@@ -34,14 +34,15 @@ import {
   MAP_TAG_TYPE,
   PCAP_TAG_TYPE,
   SELECT_GROUP_BY_DISABLE_TAGS,
-  SERVICE_MAP_SUPPORT_DB,
-  SERVICE_MAP_SUPPORT_TABLE,
+  SERVICE_MAP_SUPPORTED,
   showMetricsOpts,
   ShowMetricsVal,
   SLIMIT_DEFAULT_VALUE,
   TAG_METRIC_TYPE_NUM,
   TIME_TAG_TYPE,
-  VAR_INTERVAL_LABEL
+  VAR_INTERVAL_LABEL,
+  PROFILING_SUPPORTED,
+  PROFILING_REQUIRED_FIELDS
 } from 'consts'
 import { DATA_SOURCE_SETTINGS, getTagMapCache, SQL_CACHE } from 'utils/cache'
 import { INPUT_TAG_VAL_TYPES, SELECT_TAG_VAL_OPS } from 'components/TagValueSelector'
@@ -72,6 +73,7 @@ export type FuncSelectOpts = Array<
   LabelItem & {
     paramCount: number
     support_metric_types: number[]
+    is_support_other_operators: boolean
   }
 >
 
@@ -82,6 +84,7 @@ type MetricOptsItem = LabelItem & {
   is_agg?: boolean
   whereOnly?: boolean
   fromSelect?: BasicDataWithId
+  not_supported_operators?: string
 }
 
 export type MetricOpts = MetricOptsItem[]
@@ -123,6 +126,7 @@ export class QueryEditor extends PureComponent<Props> {
     templateVariableOpts: SelectOpts
     runQueryWarning: boolean
     copied: boolean
+    collapsed: boolean
   }
   constructor(props: any) {
     super(props)
@@ -169,11 +173,12 @@ export class QueryEditor extends PureComponent<Props> {
       gotBasicData: false,
       templateVariableOpts: [],
       runQueryWarning: false,
-      copied: false
+      copied: false,
+      collapsed: false
     }
   }
 
-  get isUsingAlerting() {
+  get usingAlerting() {
     const usingAlerting = !!this.props.app?.includes('alerting')
     if (usingAlerting) {
       this.setState({
@@ -185,7 +190,7 @@ export class QueryEditor extends PureComponent<Props> {
 
   get appTypeOptsComputed() {
     return appTypeOpts.filter(e => {
-      return !this.isUsingAlerting || ALERTING_ALLOW_APP_TYPE.includes(e.value)
+      return !this.usingAlerting || ALERTING_ALLOW_APP_TYPE.includes(e.value)
     })
   }
 
@@ -246,7 +251,8 @@ export class QueryEditor extends PureComponent<Props> {
         !tag.whereOnly &&
         !SELECT_GROUP_BY_DISABLE_TAGS.find((val: string) => {
           return (tag.value as string).includes(val)
-        })
+        }) &&
+        !tag.not_supported_operators?.includes('select')
       )
     })
   }
@@ -408,25 +414,32 @@ export class QueryEditor extends PureComponent<Props> {
   }
 
   get usingAppTraceType(): boolean {
-    return this.state.appType === 'appTracing'
+    return this.state.appType === APP_TYPE.TRACING
   }
   get usingAccessRelationshipType(): boolean {
-    return this.state.appType === 'accessRelationship'
+    return this.state.appType === APP_TYPE.SERVICE_MAP
+  }
+  get usingProfilingType(): boolean {
+    return this.state.appType === APP_TYPE.PROFILING
   }
 
   get databaseOptsAfterFilter(): SelectOpts {
     const { appType, databaseOpts } = this.state
     switch (appType) {
-      case 'appTracing':
+      case APP_TYPE.TRACING:
         return [
           {
             label: 'flow_log',
             value: 'flow_log'
           }
         ]
-      case 'accessRelationship':
+      case APP_TYPE.SERVICE_MAP:
         return databaseOpts.filter(e => {
-          return SERVICE_MAP_SUPPORT_DB.includes(e.value as string)
+          return SERVICE_MAP_SUPPORTED.DB.includes(e.value as string)
+        })
+      case APP_TYPE.PROFILING:
+        return databaseOpts.filter(e => {
+          return PROFILING_SUPPORTED.DB.includes(e.value as string)
         })
       default:
         return databaseOpts
@@ -436,16 +449,23 @@ export class QueryEditor extends PureComponent<Props> {
   get tableOptsAfterFilter(): SelectOpts {
     const { appType, tableOpts } = this.state
     switch (appType) {
-      case 'appTracing':
+      case APP_TYPE.TRACING:
         return [
           {
             label: 'l7_flow_log',
             value: 'l7_flow_log'
           }
         ]
-      case 'accessRelationship':
+      case APP_TYPE.SERVICE_MAP:
         return tableOpts.filter(e => {
-          return SERVICE_MAP_SUPPORT_TABLE.includes(e.value as string)
+          return SERVICE_MAP_SUPPORTED.TABLE.includes(e.value as string)
+        })
+      case APP_TYPE.PROFILING:
+        return PROFILING_SUPPORTED.TABLE.map(e => {
+          return {
+            label: e,
+            value: e
+          }
         })
       default:
         return tableOpts
@@ -474,7 +494,7 @@ export class QueryEditor extends PureComponent<Props> {
         return item.variableType === 'interval'
       })
       .concat(
-        !this.isUsingAlerting
+        !this.usingAlerting
           ? [
               {
                 label: VAR_INTERVAL_LABEL,
@@ -484,6 +504,31 @@ export class QueryEditor extends PureComponent<Props> {
           : []
       )
       .concat(intervalOpts)
+  }
+
+  get usingDerivativePreFunc(): {
+    hasNotSet: boolean
+    commonPreFunc: any
+  } {
+    const hasNotSet = ['select', 'having'].every(key => {
+      const current = _.get(this.state, key)
+      return current.every((e: BasicData) => {
+        return !('preFunc' in e) || e.preFunc === undefined
+      })
+    })
+    let commonPreFunc = ['select', 'having']
+      .map(key => {
+        const current = _.get(this.state, key)
+        return current
+      })
+      .flat(Infinity)
+      .find((e: BasicData) => {
+        return e.type === 'metric' && e.key
+      })?.preFunc
+    return {
+      hasNotSet,
+      commonPreFunc
+    }
   }
 
   setSourcesChange(val: LabelItem & { dataSources: null | string[] }) {
@@ -499,6 +544,25 @@ export class QueryEditor extends PureComponent<Props> {
     }
   }
 
+  derivativeChecker(select: BasicData[], having: BasicData[]) {
+    const _select = [...select, ...having].filter((e: BasicData) => {
+      return e.type === 'metric' && e.key && e.func
+    })
+    if (select.length >= 2) {
+      const hasDerivative = _select.find((e: BasicData) => {
+        return e.preFunc === 'Derivative'
+      })
+      if (hasDerivative) {
+        const allHasDerivative = _select.every((e: BasicData) => {
+          return e.preFunc === 'Derivative'
+        })
+        if (!allHasDerivative) {
+          throw new Error('All metrics can only use (or not use) the Derivative operator simultaneously.')
+        }
+      }
+    }
+  }
+
   onSubmit = async (stopQuery = false) => {
     const dataObj = _.pick(this.state, [
       'appType',
@@ -509,11 +573,16 @@ export class QueryEditor extends PureComponent<Props> {
       'tracingId'
     ])
 
+    this.setState({
+      errorMsg: '',
+      showErrorAlert: false
+    })
     try {
       dataObj.where = queryCondsFilter(dataObj?.where, 'tag')
       dataObj.having = queryCondsFilter(dataObj?.having, 'metric')
       const { appType, groupBy, select, interval, where, having, orderBy } = dataObj
       if (!stopQuery) {
+        this.derivativeChecker(select as BasicDataWithId[], dataObj.having)
         const groupByKeys = (groupBy as BasicDataWithId[])
           .filter((item: any) => {
             return item.key
@@ -531,11 +600,11 @@ export class QueryEditor extends PureComponent<Props> {
         if (hasMetricWithEmptyFuncParam) {
           throw new Error('Params is required')
         }
-        if (appType === 'accessRelationship') {
+        if (appType === APP_TYPE.SERVICE_MAP) {
           const _resourceGroupBy = groupBy!.filter(e => e.isResourceType || e.isIpType)
           if (!_resourceGroupBy.find(e => e.sideType === 'from') || !_resourceGroupBy.find(e => e.sideType === 'to')) {
             throw new Error(
-              'When using service map, need select at least one resource type tag as client and server in group by'
+              'When using Service Map, need select at least one resource type tag as client and server in GROUP BY'
             )
           }
           if (
@@ -543,7 +612,7 @@ export class QueryEditor extends PureComponent<Props> {
               return item.key
             }).length
           ) {
-            throw new Error('When using accessRelationship, need to set at least one metric in SELECT')
+            throw new Error('When using Service Map, need to set at least one metric in SELECT')
           }
         }
         if (groupByKeys.length > 0 || interval) {
@@ -559,22 +628,30 @@ export class QueryEditor extends PureComponent<Props> {
         }
         const valMetrics = (where as BasicDataWithId[]).concat(having as BasicDataWithId[])
         const valCheck = valMetrics.find((item: BasicDataWithId) => {
-          return item.key !== '' && (item.op === '' || item.val === '')
+          return (
+            item.key !== '' &&
+            (item.op === '' || item.val === '' || (Array.isArray(item.val) && item.val?.length === 0))
+          )
         })
         if (valCheck) {
-          throw new Error('When using where or having, op and val is required')
+          throw new Error('When using WHERE or HAVING, OP and VAL is required')
         }
       }
       let newQuery
-      if (appType !== APPTYPE_APP_TRACING_FLAME) {
-        const _queryText = JSON.stringify(addTimeToWhere(dataObj))
-        const parsedQueryData = genQueryParams(JSON.parse(replaceIntervalAndVariables(_queryText)), {})
+      if (appType !== APP_TYPE.TRACING_FLAME) {
+        const queryDataOriginal = addTimeToWhere(dataObj)
+        const _queryText = JSON.stringify(queryDataOriginal)
+        const parsedQueryData = genQueryParams(
+          JSON.parse(replaceIntervalAndVariables(_queryText)),
+          {},
+          queryDataOriginal
+        )
         // @ts-ignore
         const querierJsResult = querierJs.dfQuery(_.cloneDeep(parsedQueryData))
         const { returnTags, returnMetrics, sql } = querierJsResult.resource[0]
         _.set(SQL_CACHE, `${this.requestId}_${this.refId}`, sql)
         const metaExtra =
-          dataObj.appType === 'accessRelationship' ? getAccessRelationshipQueryConfig(dataObj.groupBy, returnTags) : {}
+          dataObj.appType === APP_TYPE.SERVICE_MAP ? getAccessRelationshipQueryConfig(dataObj.groupBy, returnTags) : {}
 
         newQuery = {
           returnTags,
@@ -593,6 +670,17 @@ export class QueryEditor extends PureComponent<Props> {
         runQueryWarning: false
       })
       if (!stopQuery) {
+        if (appType === APP_TYPE.PROFILING) {
+          const fields = _.cloneDeep(PROFILING_REQUIRED_FIELDS)
+          dataObj.where.forEach(e => {
+            if (fields.includes(e.key)) {
+              fields.splice(fields.indexOf(e.key), 1)
+            }
+          })
+          if (fields.length) {
+            throw new Error(`When using Continuous Profiling, ${fields.join(', ')} conditions is required`)
+          }
+        }
         setTimeout(() => {
           this.props.onRunQuery()
         })
@@ -606,8 +694,8 @@ export class QueryEditor extends PureComponent<Props> {
     }
   }
 
-  accessRelationshipTypeCheck(apptype: string) {
-    return apptype === 'accessRelationship'
+  accessRelationshipTypeCheck(appType: string) {
+    return appType === APP_TYPE.SERVICE_MAP
       ? {
           groupBy: [
             {
@@ -631,17 +719,45 @@ export class QueryEditor extends PureComponent<Props> {
       : {}
   }
 
+  preFuncChecker = (oldData: BasicData, newData: BasicData) => {
+    if (oldData.preFunc === newData.preFunc || newData.preFunc === undefined) {
+      return
+    }
+    const result: Record<string, any> = {}
+    ;['select', 'having', 'orderBy'].forEach(key => {
+      const current = _.get(this.state, key)
+      result[key] = current.map((e: BasicData) => {
+        if (e.type === 'metric' && e.key) {
+          e.preFunc = newData.preFunc
+        }
+        return {
+          ...e,
+          ...(e.type === 'metric' && e.key === 'value' ? { preFunc: newData.preFunc } : {})
+        }
+      })
+    })
+    return result
+  }
+
   onRowValChange = (a: any, newValue: any) => {
     const { target, index } = a
     this.setState((state: any, props) => {
       const _result = state[target]
       const result = JSON.parse(JSON.stringify(_result))
+      let preFuncCheckerResult
+      if (Object.keys(newValue).length === 1 && 'preFunc' in newValue) {
+        preFuncCheckerResult = this.preFuncChecker(result[index], {
+          ...result[index],
+          ...newValue
+        })
+      }
       result[index] = {
         ...result[index],
         ...newValue
       }
       return {
         [target]: result,
+        ...preFuncCheckerResult,
         errorMsg: '',
         showErrorAlert: false,
         runQueryWarning: true
@@ -687,7 +803,7 @@ export class QueryEditor extends PureComponent<Props> {
     })
   }
 
-  onFieldChange = (field: string, val: LabelItem | boolean | string, disableFormat?: boolean) => {
+  onFieldChange = async (field: string, val: LabelItem | boolean | string, disableFormat?: boolean) => {
     let result
     if (disableFormat) {
       result = val
@@ -709,11 +825,13 @@ export class QueryEditor extends PureComponent<Props> {
         metricOpts: [],
         funcOpts: []
       }
-      if (result === 'appTracing') {
+      if (result === APP_TYPE.TRACING) {
         const dbFrom = {
           db: 'flow_log',
           from: 'l7_flow_log'
         }
+        // @ts-ignore
+        await querierJs.loadTableConfig(dbFrom.from, dbFrom.db)
         newState = {
           ...newState,
           ...dbFrom,
@@ -721,7 +839,7 @@ export class QueryEditor extends PureComponent<Props> {
           where: [
             {
               type: 'tag',
-              key: 'tap_port_type',
+              key: 'capture_nic_type',
               func: '',
               op: 'IN',
               val: [
@@ -742,14 +860,76 @@ export class QueryEditor extends PureComponent<Props> {
         }
         this.getBasicData(dbFrom)
       }
-      if (result === APPTYPE_APP_TRACING_FLAME) {
+      if (result === APP_TYPE.TRACING_FLAME) {
         const dbFrom = {
           db: 'flow_log',
           from: 'l7_flow_log'
         }
+        // @ts-ignore
+        await querierJs.loadTableConfig(dbFrom.from, dbFrom.db)
         newState = {
           ...newState,
           ...dbFrom
+        }
+        this.getBasicData(dbFrom)
+      }
+      if (result === APP_TYPE.PROFILING) {
+        const dbFrom = {
+          db: PROFILING_SUPPORTED.DB[0],
+          from: PROFILING_SUPPORTED.TABLE[0]
+        }
+        // @ts-ignore
+        await querierJs.loadTableConfig(dbFrom.from, dbFrom.db)
+        newState = {
+          ...newState,
+          ...dbFrom,
+          formatAs: '',
+          where: [
+            {
+              type: 'tag',
+              key: 'app_service',
+              func: '',
+              op: 'IN',
+              val: [],
+              as: '',
+              params: [],
+              uuid: uuid(),
+              subFuncs: [],
+              whereOnly: false,
+              isResourceType: false,
+              isIpType: false
+            },
+            {
+              type: 'tag',
+              key: 'profile_language_type',
+              func: '',
+              op: 'IN',
+              val: '',
+              as: '',
+              params: [],
+              uuid: uuid()
+            },
+            {
+              type: 'tag',
+              key: 'profile_event_type',
+              func: '',
+              op: 'IN',
+              val: '',
+              as: '',
+              params: [],
+              uuid: uuid()
+            },
+            {
+              type: 'tag',
+              key: '',
+              func: '',
+              op: '',
+              val: '',
+              as: '',
+              params: [],
+              uuid: uuid()
+            }
+          ]
         }
         this.getBasicData(dbFrom)
       }
@@ -820,7 +1000,7 @@ export class QueryEditor extends PureComponent<Props> {
           .map((item: VariableModel) => {
             return {
               label: `$${item.name}`,
-              value: item.name,
+              value: `${item.type === 'interval' ? '$' : ''}${item.name}`,
               isVariable: true,
               variableType: item.type
             }
@@ -862,6 +1042,7 @@ export class QueryEditor extends PureComponent<Props> {
     try {
       const { db, from, where } = formData
       const tagValuesGroup: Record<any, any[]> = {}
+      const tagTypeGroup: Record<any, string> = {}
       where.forEach((item: BasicDataWithId) => {
         if (!item.key) {
           return
@@ -869,11 +1050,15 @@ export class QueryEditor extends PureComponent<Props> {
         const tagMapItem = getTagMapCache(db, from, getRealKey(item))
         const tagName = tagMapItem.name
         const tagType = _.get(tagMapItem, 'type')
+        tagTypeGroup[tagName] = tagType
         if (!INPUT_TAG_VAL_TYPES.includes(tagType) && SELECT_TAG_VAL_OPS.includes(item.op)) {
           if (!tagValuesGroup[tagName]) {
             tagValuesGroup[tagName] = []
           }
-          tagValuesGroup[tagName] = [...tagValuesGroup[tagName], ...(item.val as LabelItem[])]
+          tagValuesGroup[tagName] = [
+            ...tagValuesGroup[tagName],
+            ...(Array.isArray(item.val) ? item.val : ([item.val] as LabelItem[]))
+          ]
         }
       })
       const tagValuesGroupsKeys = Object.keys(tagValuesGroup)
@@ -888,6 +1073,7 @@ export class QueryEditor extends PureComponent<Props> {
           genGetTagValuesSql(
             {
               tagName,
+              tagType: _.get(tagTypeGroup, [tagName]),
               from,
               keyword: [...new Set(tagValues.map(e => e.value))]
             },
@@ -967,7 +1153,6 @@ export class QueryEditor extends PureComponent<Props> {
 
       // @ts-ignore
       const { metrics, tags, functions } = await querierJs.loadTableConfig(from, db)
-
       const funcs: any[] = []
       const subFuncs: any[] = []
       functions.forEach((e: any) => {
@@ -978,74 +1163,81 @@ export class QueryEditor extends PureComponent<Props> {
         }
       })
 
-      const metricOpts = metrics
-        .filter((item: any) => {
-          return item.type !== TAG_METRIC_TYPE_NUM
-        })
-        .map((item: any) => {
-          const { name, is_agg, operators, display_name, type } = item
-          return {
-            label: `${name} (${display_name})`,
-            value: name,
-            type,
-            is_agg,
-            operatorOpts: operators
-              ? operators.map((op: any) => {
-                  return {
-                    label: op,
-                    value: op
-                  }
-                })
-              : []
-          }
-        }) as MetricOpts
+      const metricOpts = metrics.map((item: any) => {
+        const { name, is_agg, operators, display_name, type } = item
+        return {
+          label: `${name} (${display_name})`,
+          value: name,
+          type,
+          is_agg,
+          operatorOpts: operators
+            ? operators.map((op: any) => {
+                return {
+                  label: op,
+                  value: op
+                }
+              })
+            : []
+        }
+      }) as MetricOpts
 
+      const deprecatedTags: any[] = []
       const tagOpts = tags
         .filter((item: any) => {
+          if (item.deprecated) {
+            deprecatedTags.push(item)
+            return false
+          }
           return !DISABLE_TAGS.includes(item.name)
         })
+        .concat(deprecatedTags)
         .map((item: any) => {
-          const { name, client_name, server_name, display_name, type } = item
+          const { name, client_name, server_name, display_name, type, deprecated, not_supported_operators } = item
           const operatorOpts = formatTagOperators(item)
+          const displaySuffix = deprecated ? ' ⚠️' : ''
           if (name === client_name && name === server_name) {
             return {
-              label: display_name === name ? `${name}` : `${name} (${display_name})`,
+              label: (display_name === name ? `${name}` : `${name} (${display_name})`) + displaySuffix,
               value: name,
               type,
-              operatorOpts
+              operatorOpts,
+              not_supported_operators
             }
           }
           return [
             ...((type === 'resource' || type === 'ip') && (client_name || server_name)
               ? [
                   {
-                    label: `${name} (${display_name})`,
+                    label: `${name} (${display_name})` + displaySuffix,
                     value: name,
                     type,
                     whereOnly: true,
-                    operatorOpts
+                    operatorOpts,
+                    not_supported_operators
                   }
                 ]
               : []),
             ...(client_name
               ? [
                   {
-                    label: `${client_name} (${display_name} - ${getI18NLabelByName('client')})`,
+                    label: `${client_name} (${display_name} - ${getI18NLabelByName('client')})` + displaySuffix,
                     value: client_name,
                     type,
                     sideType: 'from',
-                    operatorOpts
+                    operatorOpts,
+                    not_supported_operators
                   }
                 ]
               : []),
             ...(server_name
               ? [
                   {
-                    label: `${server_name} (${display_name} - ${getI18NLabelByName('server')})`,
+                    label: `${server_name} (${display_name} - ${getI18NLabelByName('server')})` + displaySuffix,
                     value: server_name,
                     type,
                     sideType: 'to',
-                    operatorOpts
+                    operatorOpts,
+                    not_supported_operators
                   }
                 ]
               : [])
@@ -1058,7 +1250,8 @@ export class QueryEditor extends PureComponent<Props> {
           label: item.name,
           value: item.name,
           paramCount: item.additional_param_count,
-          support_metric_types: item.support_metric_types
+          support_metric_types: item.support_metric_types,
+          is_support_other_operators: item.is_support_other_operators
         }
       }) as FuncSelectOpts
 
@@ -1090,6 +1283,7 @@ export class QueryEditor extends PureComponent<Props> {
       showErrorAlert: false
     })
   }
+
   onCopySQLBtnClick = () => {
     copy(_.get(SQL_CACHE, `${this.requestId}_${this.refId}`, ''))
     this.setState({
@@ -1100,6 +1294,12 @@ export class QueryEditor extends PureComponent<Props> {
         copied: false
       })
     }, 1800)
+  }
+
+  onCollapseBtnClick = () => {
+    this.setState({
+      collapsed: !this.state.collapsed
+    })
   }
 
   render() {
@@ -1173,7 +1373,7 @@ export class QueryEditor extends PureComponent<Props> {
                   width="auto"
                 />
               </InlineField>
-              {appType !== APPTYPE_APP_TRACING_FLAME ? (
+              {appType !== APP_TYPE.TRACING_FLAME ? (
                 <>
                   <InlineField className="custom-label" label="DATABASE" labelWidth={10}>
                     <div className="row-start-center database-selectors">
@@ -1213,7 +1413,9 @@ export class QueryEditor extends PureComponent<Props> {
                   {formConfig.map((conf: FormConfigItem, i: number) => {
                     return !(
                       (conf.targetDataKey === 'groupBy' && this.usingAppTraceType) ||
-                      (conf.targetDataKey === 'orderBy' && this.usingAccessRelationshipType)
+                      (conf.targetDataKey === 'orderBy' && this.usingAccessRelationshipType) ||
+                      (['groupBy', 'select', 'having', 'orderBy'].includes(conf.targetDataKey) &&
+                        this.usingProfilingType)
                     ) ? (
                       <>
                         <InlineField className="custom-label" label={conf.label} labelWidth={conf.labelWidth} key={i}>
@@ -1221,10 +1423,11 @@ export class QueryEditor extends PureComponent<Props> {
                             {this.state[conf.targetDataKey].map((item: BasicDataWithId, index: number) => {
                               return (
                                 <QueryEditorFormRow
-                                  isUsingAlerting={this.isUsingAlerting}
+                                  usingAlerting={this.usingAlerting}
                                   templateVariableOpts={templateVariableOpts.filter(item => {
                                     return item.variableType !== 'interval' && item.variableType !== 'datasource'
                                   })}
+                                  templateVariableOptsFull={templateVariableOpts}
                                   config={formItemConfigs[conf.targetDataKey]}
                                   basicData={item}
                                   gotBasicData={gotBasicData}
@@ -1238,7 +1441,9 @@ export class QueryEditor extends PureComponent<Props> {
                                       ? tagOpts
                                           .filter(tag => {
                                             return (
-                                              !GROUP_BY_DISABLE_TAG_TYPES.includes(tag.type as string) && !tag.whereOnly
+                                              !GROUP_BY_DISABLE_TAG_TYPES.includes(tag.type as string) &&
+                                              !tag.whereOnly &&
+                                              !tag.not_supported_operators?.includes('group')
                                             )
                                           })
                                           .filter((tag: MetricOptsItem) => {
@@ -1262,7 +1467,9 @@ export class QueryEditor extends PureComponent<Props> {
                                       ? this.orderByMetricOpts
                                       : conf.targetDataKey === 'having'
                                       ? this.metricsFromSelect.concat(this.basicMetricOpts).filter(item => {
-                                          return item.type !== MAP_METRIC_TYPE_NUM
+                                          return ![TAG_METRIC_TYPE_NUM, MAP_METRIC_TYPE_NUM].includes(
+                                            item.type as number
+                                          )
                                         })
                                       : this.basicMetricOpts
                                   }
@@ -1297,6 +1504,8 @@ export class QueryEditor extends PureComponent<Props> {
                                       type
                                     )
                                   }
+                                  usingDerivativePreFunc={this.usingDerivativePreFunc}
+                                  usingProfilingType={this.usingProfilingType}
                                 />
                               )
                             })}
@@ -1304,7 +1513,8 @@ export class QueryEditor extends PureComponent<Props> {
                         </InlineField>
                         {conf.targetDataKey === 'groupBy' &&
                         !this.usingAppTraceType &&
-                        !this.usingAccessRelationshipType ? (
+                        !this.usingAccessRelationshipType &&
+                        !this.usingProfilingType ? (
                           <InlineField className="custom-label" label="INTERVAL" labelWidth={10}>
                             <div className="w-100-percent">
                               <Select
@@ -1335,29 +1545,33 @@ export class QueryEditor extends PureComponent<Props> {
                         </div>
                       </InlineField>
                     ) : null}
-                    <InlineField className="custom-label" label="LIMIT" labelWidth={6}>
-                      <div className="w-100-percent">
-                        <Input
-                          value={limit}
-                          onChange={(ev: any) => this.onFieldChange('limit', ev.target)}
-                          placeholder="LIMIT"
-                          width={12}
-                        />
-                      </div>
-                    </InlineField>
-                    <InlineField className="custom-label" label="OFFSET" labelWidth={8}>
-                      <div className="w-100-percent">
-                        <Input
-                          value={offset}
-                          onChange={(ev: any) => this.onFieldChange('offset', ev.target)}
-                          placeholder="OFFSET"
-                          disabled={!limit}
-                          width={12}
-                        />
-                      </div>
-                    </InlineField>
+                    {!this.usingProfilingType ? (
+                      <InlineField className="custom-label" label="LIMIT" labelWidth={6}>
+                        <div className="w-100-percent">
+                          <Input
+                            value={limit}
+                            onChange={(ev: any) => this.onFieldChange('limit', ev.target)}
+                            placeholder="LIMIT"
+                            width={12}
+                          />
+                        </div>
+                      </InlineField>
+                    ) : null}
+                    {!this.usingProfilingType ? (
+                      <InlineField className="custom-label" label="OFFSET" labelWidth={8}>
+                        <div className="w-100-percent">
+                          <Input
+                            value={offset}
+                            onChange={(ev: any) => this.onFieldChange('offset', ev.target)}
+                            placeholder="OFFSET"
+                            disabled={!limit}
+                            width={12}
+                          />
+                        </div>
+                      </InlineField>
+                    ) : null}
                   </div>
-                  {this.usingGroupBy && !this.usingAccessRelationshipType ? (
+                  {this.usingGroupBy && !this.usingAccessRelationshipType && !this.usingProfilingType ? (
                     <div className="row-start-center">
                       <InlineField className="custom-label" label="FORMAT AS" labelWidth={11}>
                         <Select
@@ -1379,7 +1593,7 @@ export class QueryEditor extends PureComponent<Props> {
                               width={28}
                             />
                           </InlineField>
-                          <InlineField className="custom-label" label="SHOW METRICS" labelWidth={14}>
+                          <InlineField className="custom-label" label="SHOW METRICS" labelWidth={14.5}>
                             <div
                               style={{
                                 display: 'flex',
@@ -1433,15 +1647,32 @@ export class QueryEditor extends PureComponent<Props> {
             </>
           }
         </div>
-        {appType !== APPTYPE_APP_TRACING_FLAME && this.sqlContent ? (
+        {![APP_TYPE.TRACING_FLAME, APP_TYPE.PROFILING].includes(appType) && this.sqlContent ? (
           <div className="sql-content-wrapper">
-            <div className="sql-content" dangerouslySetInnerHTML={{ __html: this.sqlContent }}></div>
-            <Button
-              style={{ position: 'absolute', right: 0, top: 0 }}
-              fill="text"
-              icon={this.state.copied ? 'check' : 'copy'}
-              onClick={this.onCopySQLBtnClick}
-            />
+            <div
+              className="sql-content"
+              style={{
+                maxHeight: this.state.collapsed ? '32px' : '',
+                padding: this.state.collapsed ? '32px 6px 0 6px' : ''
+              }}
+              dangerouslySetInnerHTML={{ __html: this.sqlContent }}
+            ></div>
+            <Tooltip content={this.state.collapsed ? 'Show' : 'Hide'} placement="top">
+              <Button
+                style={{ position: 'absolute', right: '32px', top: 0 }}
+                fill="text"
+                icon={this.state.collapsed ? 'eye' : 'eye-slash'}
+                onClick={this.onCollapseBtnClick}
+              />
+            </Tooltip>
+            <Tooltip content={this.state.copied ? 'Copied' : 'Copy'} placement="top">
+              <Button
+                style={{ position: 'absolute', right: 0, top: 0 }}
+                fill="text"
+                icon={this.state.copied ? 'check' : 'copy'}
+                onClick={this.onCopySQLBtnClick}
+              />
+            </Tooltip>
           </div>
         ) : null}
       </div>

@@ -15,6 +15,7 @@ export interface MyQuery extends DataQuery {
       }
     | {}
   _id?: string
+  profile_event_type?: string
 }
 
 /**
@@ -24,6 +25,7 @@ export interface MyDataSourceOptions extends DataSourceJsonData {
   requestUrl: string
   token: string
   traceUrl: string
+  aiUrl: string
   doRequest: any
 }
 
@@ -34,4 +36,5 @@ export interface MyJsonData {
   requestUrl: string
   token: string
   traceUrl: string
+  aiUrl: string
 }

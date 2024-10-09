@@ -21,28 +21,32 @@ import {
 } from 'utils/tools'
 import _ from 'lodash'
 import * as querierJs from 'deepflow-sdk-js'
-import { genQueryParams, replaceIntervalAndVariables } from 'utils/genQueryParams'
+import { genQueryParams, getFiledValueFormSql, getProfilingSql, replaceIntervalAndVariables } from 'utils/genQueryParams'
 import { DATA_SOURCE_SETTINGS, QUERY_DATA_CACHE, SQL_CACHE } from 'utils/cache'
 import { MyVariableQuery } from 'components/VariableQueryEditor'
 import { Observable, of, zip } from 'rxjs'
 import { catchError, switchMap } from 'rxjs/operators'
-import { APPTYPE_APP_TRACING_FLAME } from 'consts'
+import { APP_TYPE } from 'consts'
+import DataStreamer from 'utils/dataStreamer'
 
 export class DataSource extends DataSourceWithBackend<MyQuery, MyDataSourceOptions> {
   url: string
   constructor(instanceSettings: DataSourceInstanceSettings<MyDataSourceOptions>) {
     super(instanceSettings)
     this.url = instanceSettings.url || ''
-    const { token } = instanceSettings.jsonData
+    DATA_SOURCE_SETTINGS.basicUrl = this.url
+    const { token, aiUrl } = instanceSettings.jsonData
+    DATA_SOURCE_SETTINGS.aiUrl = aiUrl
     // @ts-ignore
     const test = (method: string, url, params, headers) => {
       const data = _.omit(params, 'requestId')
       const requestIdSetting = _.pick(params, 'requestId')
       const f = () => {
         const debugOnOff = getParamByName('debug') === 'true'
+        const { basicUrl } = DATA_SOURCE_SETTINGS
         const fetchOption = {
           method,
-          url: `${this.url}${token ? '/auth/api/querier' : '/noauth'}/v1/query/${debugOnOff ? '?debug=true' : ''}`,
+          url: `${basicUrl}${token ? '/auth/api/querier' : '/noauth'}/v1/query/${debugOnOff ? '?debug=true' : ''}`,
           data: qs.stringify(data),
           headers,
           responseType: 'text',
@@ -94,7 +98,7 @@ export class DataSource extends DataSourceWithBackend<MyQuery, MyDataSourceOptio
     _targets.forEach(q => {
       const queryData = JSON.parse(q.queryText)
       const { appType, from, db } = queryData
-      if (!hasAddedTracingConfig && appType === APPTYPE_APP_TRACING_FLAME) {
+      if (!hasAddedTracingConfig && appType === APP_TYPE.TRACING_FLAME) {
         hasAddedTracingConfig = true
         tracingQueryIndex = promisesList.length
         _.set(q, ['_id'], getTracingId(queryData.tracingId))
@@ -193,24 +197,30 @@ export class DataSource extends DataSourceWithBackend<MyQuery, MyDataSourceOptio
   }
 
   applyTemplateVariables(query: MyQuery & { requestId: string }, scopedVars: ScopedVars): any {
+    const queryDataOriginal = JSON.parse(query.queryText)
     const _queryText = replaceIntervalAndVariables(query.queryText, scopedVars)
     const queryData = JSON.parse(_queryText)
     const result = {} as MyQuery
     // set new params after replaced variables
-    if (queryData.appType !== APPTYPE_APP_TRACING_FLAME) {
-      const parsedQueryData = genQueryParams(addTimeToWhere(queryData), scopedVars)
+    if (queryData.appType !== APP_TYPE.TRACING_FLAME) {
+      const parsedQueryData = genQueryParams(addTimeToWhere(queryData), scopedVars, queryDataOriginal)
       // @ts-ignore
       const querierJsResult = querierJs.dfQuery(_.cloneDeep(parsedQueryData))
       const { returnTags, returnMetrics, sql } = querierJsResult.resource[0]
       _.set(SQL_CACHE, `${query.requestId}_${query.refId}`, sql)
       const metaExtra =
-        queryData.appType === 'accessRelationship'
+        queryData.appType === APP_TYPE.SERVICE_MAP
           ? getAccessRelationshipQueryConfig(queryData.groupBy, returnTags)
           : {}
 
       result.returnTags = returnTags
       result.returnMetrics = returnMetrics
-      result.sql = sql
+      if (queryData.appType === APP_TYPE.PROFILING) {
+        result.sql = getProfilingSql(sql)
+        result.profile_event_type = getFiledValueFormSql(sql, 'profile_event_type')
+      } else {
+        result.sql = sql
+      }
       result.metaExtra = metaExtra
     }
     result.debug = getParamByName('debug') === 'true'
@@ -236,9 +246,9 @@ export class DataSource extends DataSourceWithBackend<MyQuery, MyDataSourceOptio
         'syscall_cap_seq_0',
         'syscall_cap_seq_1',
         'flow_id',
-        'vtap',
-        'tap_port_type',
-        'tap_port',
+        'agent',
+        'capture_nic_type',
+        'capture_nic',
         'start_time',
         'end_time'
       ]
@@ -281,7 +291,7 @@ export class DataSource extends DataSourceWithBackend<MyQuery, MyDataSourceOptio
       const { sql } = querierJsResult.resource[0]
       // @ts-ignore
       const response = await querierJs.searchBySql(sql, 'flow_log')
-      return response.map((e: any) => _.omit(e, 'vtap_id'))
+      return response.map((e: any) => _.omit(e, 'agent_id'))
     } catch (error) {
       console.log(error)
       return error
@@ -294,6 +304,15 @@ export class DataSource extends DataSourceWithBackend<MyQuery, MyDataSourceOptio
       return []
     }
 
+    const currentDatasourceUrl = this.url
+    if (DATA_SOURCE_SETTINGS.basicUrl !== this.url) {
+      DATA_SOURCE_SETTINGS.basicUrl = currentDatasourceUrl
+      // clear tags cache
+      const cacheKeys = ['TagMapCache', 'CTagMapCache', 'STagMapCache']
+      cacheKeys.forEach((cacheKey: string) => {
+        _.set(querierJs, cacheKey, {})
+      })
+    }
     const _sql = getTemplateSrv().replace(sql, {}, 'csv')
     // @ts-ignore
     const response = await querierJs.searchBySql(_sql, database, params => {
@@ -329,5 +348,62 @@ export class DataSource extends DataSourceWithBackend<MyQuery, MyDataSourceOptio
           })
         : []
     )
+  }
+
+  async getAIConfigs() {
+    const fetchOption = {
+      method: 'get',
+      url: `${DATA_SOURCE_SETTINGS.basicUrl}/ai/v1/llm_agent_config`
+    } as BackendSrvRequest
+    return await getBackendSrv()
+      .fetch(fetchOption)
+      .toPromise()
+      .then((res: any) => {
+        const { DATA } = res.data
+        return DATA
+      })
+  }
+
+  async askGPTRequest(
+    engine: { platform: string; engine_name: string },
+    postData: { system_content: string; user_content: string },
+    receiveFn: any
+  ) {
+    let answer = ''
+
+    const onStreamEnd = () => {
+      receiveFn({
+        isEnd: true,
+        char: answer,
+        streamer
+      })
+    }
+    const streamer = new DataStreamer(onStreamEnd)
+    streamer.output(char => {
+      receiveFn({
+        isEnd: false,
+        char,
+        streamer
+      })
+    }, 32)
+
+    const fetchOption = {
+      method: 'post',
+      url: `${DATA_SOURCE_SETTINGS.basicUrl}/ai/v1/ai/stream/${engine.platform}?engine=${engine.engine_name}`,
+      responseType: 'text',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      data: JSON.stringify(postData)
+    } as BackendSrvRequest
+    await getBackendSrv()
+      .fetch(fetchOption)
+      .toPromise()
+      .then((res: any) => {
+        answer = res.data
+        streamer.write(res.data)
+      })
+
+    streamer.end()
   }
 }
